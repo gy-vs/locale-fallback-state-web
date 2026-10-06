@@ -1,34 +1,189 @@
-import {useEffect, useMemo, useState} from 'react';
-import {Languages, Save} from 'lucide-react';
-
-type Message = {key: string; value: string | number | boolean | null; source: string; revision: number};
+import {useCallback, useEffect, useMemo, useState} from 'react';
+import {Languages} from 'lucide-react';
+import type {Locale} from '../shared/locales';
+import type {StoredTranslation, WorkbenchState} from '../shared/model';
+import {allStats, resolveLocale} from '../shared/resolve';
+import {api} from './api';
+import {LocaleTabs} from './LocaleTabs';
+import {KeyList} from './KeyList';
+import {Editor} from './Editor';
+import {PreviewPane} from './PreviewPane';
+import {FallbackEditor} from './FallbackEditor';
+import {useSaveQueue} from './useSaveQueue';
 
 export default function App() {
-  const [locale, setLocale] = useState('fr-FR');
-  const [items, setItems] = useState<Message[]>([]);
-  const [selected, setSelected] = useState('welcome');
-  const [draft, setDraft] = useState('');
-  const [status, setStatus] = useState('Ready');
-  const active = useMemo(() => items.find(item => item.key === selected), [items, selected]);
+  const [state, setState] = useState<WorkbenchState | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [locale, setLocale] = useState<Locale>('fr-CA');
+  const [selectedKey, setSelectedKey] = useState<string>('checkout.title');
+  const [showFallback, setShowFallback] = useState(false);
 
-  useEffect(() => { fetch('/api/messages?locale=' + locale).then(r => r.json()).then((rows: Message[]) => { setItems(rows); const item = rows.find(row => row.key === selected); setDraft(String(item?.value ?? '')); }); }, [locale]);
-  useEffect(() => { if (active) setDraft(String(active.value ?? '')); }, [active?.key]);
+  const refresh = useCallback(async () => {
+    const next = await api.state();
+    setState(next);
+  }, []);
+
   useEffect(() => {
-    if (!active || draft === String(active.value ?? '')) return;
-    setStatus('Saving');
-    const timer = window.setTimeout(() => {
-      fetch('/api/messages/' + active.key, {method: 'PUT', headers: {'content-type': 'application/json'}, body: JSON.stringify({locale, value: draft, revision: active.revision})})
-        .then(r => r.json()).then(saved => { setItems(rows => rows.map(row => row.key === saved.key ? {...row, ...saved} : row)); setDraft(String(saved.value)); setStatus('Saved'); });
-    }, 180);
-    return () => window.clearTimeout(timer);
-  }, [draft, active?.key, locale]);
+    refresh().catch(caught => setError(caught instanceof Error ? caught.message : 'failed to load'));
+  }, [refresh]);
 
-  return <main className="shell">
-    <header className="topbar"><Languages size={20}/><span className="brand">Locale Workbench</span><small>Message editor</small></header>
-    <section className="workspace">
-      <aside className="pane"><div className="toolbar"><select value={locale} onChange={event => setLocale(event.target.value)}><option>fr-FR</option><option>en</option></select></div><div className="list">{items.map(item => <button className={selected === item.key ? 'active' : ''} key={item.key} onClick={() => setSelected(item.key)}>{item.key}<br/><small>from {item.source}</small></button>)}</div></aside>
-      <section className="pane"><div className="toolbar"><button className="primary"><Save size={15}/> Autosave</button><span className="status">{status}</span></div><textarea aria-label="Translation" value={draft} onChange={event => setDraft(event.target.value)}/></section>
-      <section className="pane"><h2>Preview</h2><span className="pill">{locale}</span><p>{draft.replace('{name}', 'Ari').replace('{count}', '3')}</p><h3>Revision</h3><pre>{JSON.stringify(active, null, 2)}</pre></section>
-    </section>
-  </main>;
+  // A confirmed save is patched into the local snapshot immediately. The
+  // list/stats all derive from `state`, so there is no second cache that
+  // could keep showing a stale result.
+  const onSaved = useCallback((key: string, savedLocale: Locale, cell: StoredTranslation) => {
+    setState(previous => {
+      if (!previous) return previous;
+      return {
+        ...previous,
+        keys: previous.keys.map(record =>
+          record.key !== key
+            ? record
+            : {...record, translations: {...record.translations, [savedLocale]: cell}},
+        ),
+      };
+    });
+  }, []);
+
+  const saves = useSaveQueue({onSaved});
+
+  const switchLocale = useCallback(
+    (next: Locale) => {
+      if (next === locale) return;
+      saves.flushLocale(locale); // late saves must never touch the new locale
+      saves.clearConflict();
+      setLocale(next);
+    },
+    [locale, saves],
+  );
+
+  const cells = useMemo(
+    () => (state ? resolveLocale(state, locale) : []),
+    [state, locale],
+  );
+  const stats = useMemo(() => (state ? allStats(state) : []), [state]);
+  const record = state?.keys.find(entry => entry.key === selectedKey) ?? null;
+  const cell = cells.find(entry => entry.key === selectedKey) ?? null;
+
+  const saveChain = async (chain: Locale[]) => {
+    await api.setChain(locale, chain);
+    await refresh(); // list, stats and resolve all read the new graph
+  };
+
+  if (error) {
+    return (
+      <main className="shell">
+        <p className="fatal">⚠ {error}</p>
+      </main>
+    );
+  }
+  if (!state || !record || !cell) {
+    return (
+      <main className="shell">
+        <p className="fatal">Loading workbench…</p>
+      </main>
+    );
+  }
+
+  return (
+    <main className="shell">
+      <header className="topbar">
+        <Languages size={20} />
+        <span className="brand">Locale Workbench</span>
+        <small>fallback-aware translation state</small>
+        <button type="button" className="ghost" onClick={() => setShowFallback(value => !value)}>
+          {showFallback ? 'Close fallback settings' : 'Fallback chains'}
+        </button>
+      </header>
+
+      <LocaleTabs active={locale} stats={stats} onSelect={switchLocale} />
+
+      {showFallback && (
+        <div className="fallback-drawer">
+          <FallbackEditor locale={locale} chain={state.fallback[locale] ?? []} onSave={saveChain} />
+        </div>
+      )}
+
+      <section className="workspace">
+        <KeyList
+          cells={cells}
+          selectedKey={selectedKey}
+          stats={stats.find(entry => entry.locale === locale)!}
+          onSelect={setSelectedKey}
+        />
+        <section className="pane editor-pane">
+          <Editor
+            locale={locale}
+            record={record}
+            cell={cell}
+            saveStatus={saves.status}
+            onSaveDraft={(text, baseVersion) =>
+              saves.scheduleSave(selectedKey, locale, text, baseVersion)
+            }
+            onSaveSource={async (source, baseVersion) => {
+              await api.saveSource(selectedKey, source, baseVersion);
+              await refresh();
+            }}
+            onMarkReviewed={async () => {
+              await api.markReviewed(selectedKey, locale);
+              await refresh();
+            }}
+          />
+          {saves.conflict && (
+            <ConflictDialog
+              conflict={saves.conflict}
+              currentLocale={locale}
+              onKeepMine={() => {
+                const {serverCell, attemptedText, key} = saves.conflict!;
+                saves.clearConflict();
+                saves.scheduleSave(key, locale, attemptedText, serverCell.version);
+              }}
+              onTakeTheirs={() => {
+                saves.clearConflict();
+                refresh();
+              }}
+            />
+          )}
+        </section>
+        <PreviewPane locale={locale} entryKey={selectedKey} text={cell.text} />
+      </section>
+    </main>
+  );
+}
+
+function ConflictDialog({
+  conflict,
+  currentLocale,
+  onKeepMine,
+  onTakeTheirs,
+}: {
+  conflict: NonNullable<ReturnType<typeof useSaveQueue>['conflict']>;
+  currentLocale: Locale;
+  onKeepMine: () => void;
+  onTakeTheirs: () => void;
+}) {
+  if (conflict.locale !== currentLocale) return null;
+  return (
+    <div className="modal-backdrop" role="dialog" aria-modal="true">
+      <div className="modal">
+        <h3>Save conflict · {conflict.key}</h3>
+        <p>Another translator saved a newer version while your save was in flight.</p>
+        <div className="conflict-side">
+          <h4>Server (v{conflict.serverCell.version})</h4>
+          <pre>{conflict.serverCell.text}</pre>
+        </div>
+        <div className="conflict-side">
+          <h4>Your unsaved text</h4>
+          <pre>{conflict.attemptedText}</pre>
+        </div>
+        <div className="modal-actions">
+          <button type="button" className="primary" onClick={onKeepMine}>
+            Overwrite with mine
+          </button>
+          <button type="button" onClick={onTakeTheirs}>
+            Discard mine, take theirs
+          </button>
+        </div>
+      </div>
+    </div>
+  );
 }
